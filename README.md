@@ -62,7 +62,7 @@ Five containers, one purpose — answer **when, how often, and how badly is my c
 On a new Raspberry Pi OS (64-bit) install, run this **on the Pi**:
 
 ```bash
-git clone https://github.com/yrafique/Network-Tools-Home-Connection-Monitor.git
+git clone https://github.com/yrafique/Network-Tools-Home-Connection-Monitor.git home-network-monitor
 cd home-network-monitor
 ./setup.sh
 ```
@@ -72,7 +72,7 @@ cd home-network-monitor
 ### Deploy to a Raspberry Pi from your Mac
 
 ```bash
-git clone https://github.com/yrafique/Network-Tools-Home-Connection-Monitor.git
+git clone https://github.com/yrafique/Network-Tools-Home-Connection-Monitor.git home-network-monitor
 cd home-network-monitor
 cp .env.example .env        # edit targets, password, alerts
 PI_HOST=user@mypi.local ./deploy.sh   # syncs files → builds → starts → verifies
