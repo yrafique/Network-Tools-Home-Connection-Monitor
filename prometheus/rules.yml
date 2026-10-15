@@ -99,3 +99,68 @@ groups:
         expr: |
           internet_ping_rtt_avg_ms
             - on(target) group_left(owner) internet_latency_seasonal_expected_ms
+
+  # ---------------------------------------------------------------------------
+  # Monitor liveness / anti-stall.
+  # A hung probe loop used to freeze every gauge at its last healthy value, so
+  # Prometheus kept scraping "up" straight through a real outage (e.g. the
+  # 2026-06-25 router reboot was invisible). The monitor now publishes a
+  # heartbeat; these rules turn a stale heartbeat into an explicit DOWN and a
+  # firing alert so an outage can never be silently missed again.
+  # ---------------------------------------------------------------------------
+  - name: internet_monitor_health
+    interval: 15s
+    rules:
+      # Seconds since the last completed probe cycle (absent if the monitor has
+      # never reported — treated as stale by the alerts below).
+      - record: internet:monitor:seconds_since_cycle
+        expr: time() - internet_probe_heartbeat_unixtime
+      # 1 while probe data is fresh, 0 once it goes stale.
+      - record: internet:monitor:fresh
+        expr: (time() - internet_probe_heartbeat_unixtime) < bool 60
+      # internet_up but forced to 0 whenever the data is stale, so a frozen
+      # gauge can NEVER read as "up". Dashboards/alerts should prefer this.
+      - record: internet:effective_up
+        expr: internet_up * on() group_left() (internet:monitor:fresh)
+
+      # The probe loop stalled or the process is dead — outage detection is
+      # blind. This is the alert that would have caught the missed reboot.
+      - alert: InternetMonitorStalled
+        expr: (time() - internet_probe_heartbeat_unixtime > 60) or absent(internet_probe_heartbeat_unixtime)
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "Internet monitor probe loop stalled or dead"
+          description: "No completed probe cycle for over 60s — internet_up is being forced down by the watchdog."
+
+      # Prometheus cannot even scrape the exporter (container down / frozen).
+      - alert: InternetMonitorScrapeDown
+        expr: up{job="monitor"} == 0
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "Prometheus cannot scrape the monitor exporter"
+          description: "The monitor:8000 target has been unreachable for 30s."
+
+      # Real WAN outage: every non-LAN provider unreachable (reuses the existing
+      # divergence recording rule, now trustworthy thanks to the watchdog).
+      - alert: InternetAllProvidersDown
+        expr: internet:all_down == 1
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "All WAN providers unreachable (ISP / link outage)"
+          description: "Every monitored internet target has been down for 30s."
+
+      # A single provider/target is down (partial outage).
+      - alert: InternetProviderDown
+        expr: internet:effective_up{owner!="LAN"} == 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.target }} unreachable"
+          description: "{{ $labels.target }} ({{ $labels.owner }}) has been unreachable for 1m."

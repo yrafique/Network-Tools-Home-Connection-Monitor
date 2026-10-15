@@ -8,6 +8,7 @@ import socket
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FuturesTimeout
 
 import requests
 from icmplib import ping as icmp_ping
@@ -38,6 +39,14 @@ PING_PACKET_TIMEOUT = float(os.environ.get("PING_PACKET_TIMEOUT_SECONDS", "2"))
 HTTP_TIMEOUT = float(os.environ.get("HTTP_TIMEOUT_SECONDS", "5"))
 EXPORTER_PORT = int(os.environ.get("EXPORTER_PORT", "8000"))
 
+# Anti-stall guarantees. A single hung probe must never freeze the whole loop
+# (the failure mode that silently hid a real router reboot): every cycle has a
+# hard wall-clock deadline, and a watchdog forces all targets DOWN if the loop
+# stops completing cycles entirely. PROBE_DEADLINE must stay < PROBE_INTERVAL.
+PROBE_DEADLINE = float(os.environ.get("PROBE_DEADLINE_SECONDS", "20"))
+STALL_THRESHOLD = float(os.environ.get("STALL_THRESHOLD_SECONDS", "60"))
+WATCHDOG_INTERVAL = float(os.environ.get("WATCHDOG_INTERVAL_SECONDS", "5"))
+
 # --------------------------------------------------------------------------- #
 # Metrics
 # --------------------------------------------------------------------------- #
@@ -65,9 +74,63 @@ HTTP_OK = Gauge("internet_http_reachable", "1 if HTTP request succeeded, else 0"
 
 SCRAPE_DURATION = Gauge("internet_probe_cycle_seconds", "Wall-clock duration of the last probe cycle")
 
+# Liveness / anti-stall signals. A gauge that simply stops updating looks
+# identical to "healthy" in Prometheus, so we publish an explicit heartbeat and
+# staleness so a stalled monitor is unmistakable instead of silently green.
+HEARTBEAT = Gauge("internet_probe_heartbeat_unixtime", "Unix time the last probe cycle fully completed")
+SECONDS_SINCE_CYCLE = Gauge("internet_seconds_since_last_cycle", "Seconds since the last completed probe cycle")
+MONITOR_STALLED = Gauge("internet_monitor_stalled", "1 if the watchdog forced targets down because the loop stalled")
+
 # Latest up/down reading per ping target, fed to the outage logger each cycle.
 LATEST_UP: dict[str, int] = {}
 OUTAGES = OutageLog()
+
+# Unix time of the last fully-completed cycle; a mutable holder so the watchdog
+# thread sees updates from the main loop without extra locking.
+_LAST_CYCLE = [0.0]
+
+
+# --------------------------------------------------------------------------- #
+# Down-marking helpers (shared by probe failure paths, the cycle deadline, and
+# the watchdog so a timed-out or stalled probe records exactly like a real miss)
+# --------------------------------------------------------------------------- #
+def _ping_label(target: str) -> tuple[str, str]:
+    """(target, owner) label pair, matching what probe_ping publishes. Cached."""
+    return (target, enrich.owner(target))
+
+
+def _mark_ping_down(target: str) -> None:
+    lbl = _ping_label(target)
+    PROBE_OK.labels(*lbl).set(0)
+    PING_LOSS.labels(*lbl).set(1.0)
+    PING_RTT_MIN.labels(*lbl).set(float("nan"))
+    PING_RTT_AVG.labels(*lbl).set(float("nan"))
+    PING_RTT_MAX.labels(*lbl).set(float("nan"))
+    PING_JITTER.labels(*lbl).set(float("nan"))
+    TARGET_UP.labels(*lbl).set(0)
+    LATEST_UP[target] = 0
+
+
+def _mark_dns_down(host: str) -> None:
+    owner = enrich.owner(host)
+    DNS_LOOKUP.labels(host, owner).set(float("nan"))
+    DNS_OK.labels(host, owner).set(0)
+
+
+def _mark_http_down(url: str) -> None:
+    owner = enrich.url_owner(url)
+    HTTP_RESPONSE.labels(url, owner).set(float("nan"))
+    HTTP_OK.labels(url, owner).set(0)
+
+
+def _mark_timeout(kind: str, target: str) -> None:
+    """A probe blew its deadline (or crashed) — treat the target as down."""
+    if kind == "ping":
+        _mark_ping_down(target)
+    elif kind == "dns":
+        _mark_dns_down(target)
+    elif kind == "http":
+        _mark_http_down(target)
 
 
 # --------------------------------------------------------------------------- #
@@ -104,14 +167,7 @@ def probe_ping(target: str) -> None:
             TARGET_UP.labels(*lbl).set(0)
             LATEST_UP[target] = 0
     except Exception:  # noqa: BLE001 - any failure means the target is down
-        PROBE_OK.labels(*lbl).set(0)
-        PING_LOSS.labels(*lbl).set(1.0)
-        PING_RTT_MIN.labels(*lbl).set(float("nan"))
-        PING_RTT_AVG.labels(*lbl).set(float("nan"))
-        PING_RTT_MAX.labels(*lbl).set(float("nan"))
-        PING_JITTER.labels(*lbl).set(float("nan"))
-        TARGET_UP.labels(*lbl).set(0)
-        LATEST_UP[target] = 0
+        _mark_ping_down(target)
 
 
 def probe_dns(host: str) -> None:
@@ -143,29 +199,90 @@ def probe_http(url: str) -> None:
 # Main loop
 # --------------------------------------------------------------------------- #
 def run_cycle(pool: ThreadPoolExecutor) -> None:
-    futures = []
-    futures += [pool.submit(probe_ping, t) for t in PING_TARGETS]
-    futures += [pool.submit(probe_dns, h) for h in DNS_TARGETS]
-    futures += [pool.submit(probe_http, u) for u in HTTP_TARGETS]
-    for f in futures:
-        f.result()
+    """Run one probe cycle under a hard deadline.
+
+    Every probe is awaited only until a shared wall-clock deadline; a probe that
+    blocks past it (e.g. the interface went fully down) is abandoned and its
+    target marked DOWN. This guarantees the loop ALWAYS finishes, records the
+    outage, and heartbeats — instead of hanging and freezing gauges at "up".
+    """
+    jobs = [(pool.submit(probe_ping, t), "ping", t) for t in PING_TARGETS]
+    jobs += [(pool.submit(probe_dns, h), "dns", h) for h in DNS_TARGETS]
+    jobs += [(pool.submit(probe_http, u), "http", u) for u in HTTP_TARGETS]
+
+    deadline = time.monotonic() + PROBE_DEADLINE
+    for fut, kind, target in jobs:
+        remaining = max(0.0, deadline - time.monotonic())
+        try:
+            fut.result(timeout=remaining)
+        except FuturesTimeout:
+            _mark_timeout(kind, target)
+            print(f"[monitor] probe {kind}:{target} exceeded {PROBE_DEADLINE}s deadline -> DOWN", flush=True)
+        except Exception as exc:  # noqa: BLE001 - a crashed probe is a down probe
+            _mark_timeout(kind, target)
+            print(f"[monitor] probe {kind}:{target} errored -> DOWN: {exc}", flush=True)
+
     OUTAGES.record({t: LATEST_UP.get(t, 0) for t in PING_TARGETS})
+    now = time.time()
+    _LAST_CYCLE[0] = now
+    HEARTBEAT.set(now)
+    SECONDS_SINCE_CYCLE.set(0.0)
+    MONITOR_STALLED.set(0)
+
+
+def _watchdog_tick(now: float) -> None:
+    """One liveness check. If the loop hasn't completed a cycle within
+    STALL_THRESHOLD, force every target DOWN and log the outage so a wedged
+    main loop can never read as healthy."""
+    last = _LAST_CYCLE[0]
+    if not last:
+        return
+    age = now - last
+    SECONDS_SINCE_CYCLE.set(age)
+    if age > STALL_THRESHOLD:
+        MONITOR_STALLED.set(1)
+        for target in PING_TARGETS:
+            _mark_ping_down(target)
+        try:
+            OUTAGES.record({t: 0 for t in PING_TARGETS})
+        except Exception as exc:  # noqa: BLE001 - never let the guard die
+            print(f"[watchdog] outage record failed: {exc}", flush=True)
+        print(f"[watchdog] STALL: {age:.0f}s since last cycle (> {STALL_THRESHOLD}s) -> all targets forced DOWN", flush=True)
+    else:
+        MONITOR_STALLED.set(0)
+
+
+def watchdog() -> None:
+    print(f"[watchdog] liveness guard | stall_threshold={STALL_THRESHOLD}s tick={WATCHDOG_INTERVAL}s", flush=True)
+    while True:
+        time.sleep(WATCHDOG_INTERVAL)
+        try:
+            _watchdog_tick(time.time())
+        except Exception as exc:  # noqa: BLE001 - the guard must outlive everything
+            print(f"[watchdog] tick error: {exc}", flush=True)
 
 
 def main() -> None:
     print(
         f"[monitor] starting exporter on :{EXPORTER_PORT} | "
-        f"interval={PROBE_INTERVAL}s | ping_targets={PING_TARGETS}",
+        f"interval={PROBE_INTERVAL}s deadline={PROBE_DEADLINE}s | ping_targets={PING_TARGETS}",
         flush=True,
     )
     start_http_server(EXPORTER_PORT)
+    # Seed the heartbeat so the watchdog doesn't trip during startup.
+    _LAST_CYCLE[0] = time.time()
+    HEARTBEAT.set(_LAST_CYCLE[0])
     threading.Thread(target=analyzer.run, name="analyzer", daemon=True).start()
     threading.Thread(target=path.run, name="path", daemon=True).start()
     threading.Thread(target=loadtest.run, name="loadtest", daemon=True).start()
-    with ThreadPoolExecutor(max_workers=16) as pool:
+    threading.Thread(target=watchdog, name="watchdog", daemon=True).start()
+    with ThreadPoolExecutor(max_workers=32) as pool:
         while True:
             start = time.perf_counter()
-            run_cycle(pool)
+            try:
+                run_cycle(pool)
+            except Exception as exc:  # noqa: BLE001 - a cycle must never kill the loop
+                print(f"[monitor] cycle error (loop continues, watchdog covers): {exc}", flush=True)
             elapsed = time.perf_counter() - start
             SCRAPE_DURATION.set(elapsed)
             time.sleep(max(0.0, PROBE_INTERVAL - elapsed))

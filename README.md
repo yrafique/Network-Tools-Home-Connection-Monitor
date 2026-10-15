@@ -57,7 +57,19 @@ Five containers, one purpose — answer **when, how often, and how badly is my c
 
 ## Quick start
 
-### Deploy to a Raspberry Pi (recommended)
+### Fresh Pi, one command (recommended)
+
+On a new Raspberry Pi OS (64-bit) install, run this **on the Pi**:
+
+```bash
+git clone https://github.com/yrafique/home-network-monitor.git
+cd home-network-monitor
+./setup.sh
+```
+
+`setup.sh` installs Docker Engine and the Compose plugin if missing, creates `.env` from `.env.example` on the first run, then builds and starts the whole stack. The containers restart automatically on every boot. Edit `.env` and re-run `./setup.sh` to apply changes. Re-running is safe.
+
+### Deploy to a Raspberry Pi from your Mac
 
 ```bash
 git clone https://github.com/yrafique/home-network-monitor.git
@@ -231,6 +243,7 @@ home-network-monitor/
 ├── prometheus/             # Scrape config + recording rules
 ├── data/                   # Runtime data — outages.jsonl, speedtest state
 ├── docker-compose.yml
+├── setup.sh                     # One-command install on a fresh Pi
 ├── docker-compose.override.yml   # Mac-local overrides (disables speedtest)
 ├── .env.example
 └── deploy.sh               # One-command Pi deploy with health verification
