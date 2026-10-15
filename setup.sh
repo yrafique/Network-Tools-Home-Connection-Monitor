@@ -2,7 +2,7 @@
 # setup.sh — fresh-install bootstrap for a dedicated monitoring host (e.g. a new Pi).
 #
 # Run ON the host itself, from the cloned repo:
-#   git clone https://github.com/yrafique/home-network-monitor.git
+#   git clone https://github.com/yrafique/Network-Tools-Home-Connection-Monitor.git
 #   cd home-network-monitor && ./setup.sh
 #
 # Installs Docker Engine + Compose plugin if missing, creates .env from
